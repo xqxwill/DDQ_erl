@@ -7,7 +7,8 @@ Some methods are not consistent with super class Agent.
 
 @author: Baolin Peng
 '''
-
+import logging
+import os.path
 import random, copy, json
 import cPickle as pickle
 import sys
@@ -19,19 +20,21 @@ from deep_dialog import dialog_config
 
 from agent import Agent
 from deep_dialog.qlearning import DQN
+from deep_dialog.qlearning import Value, MultiDiscretePolicy
 
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
+
 
 import tensorflow as tf
+import torch.nn.functional as F
 
 DEVICE = torch.device('cpu')
 
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'term'))
 
 
-class AgentDQN(Agent):
+class AgentPPO(Agent):
     def __init__(self, movie_dict=None, act_set=None, slot_set=None, params=None):
         self.movie_dict = movie_dict
         self.act_set = act_set
@@ -61,12 +64,19 @@ class AgentDQN(Agent):
         self.max_turn = params['max_turn'] + 5
         self.state_dimension = 2 * self.act_cardinality + 7 * self.slot_cardinality + 3 + self.max_turn
 
-        self.dqn = DQN(self.state_dimension, self.hidden_size, self.num_actions).to(DEVICE)
-        self.target_dqn = DQN(self.state_dimension, self.hidden_size, self.num_actions).to(DEVICE)
-        self.target_dqn.load_state_dict(self.dqn.state_dict())
-        self.target_dqn.eval()
+        self.tau = 0.95
+        self.ppo_epsilon = 0.2
+        self.ppo_value = Value(self.state_dimension, 30).to(DEVICE)
+        self.policy = MultiDiscretePolicy(self.state_dimension, 60, self.num_actions).to(DEVICE)
+        self.policy_optim = optim.RMSprop(self.policy.parameters(), lr=0.0001)
+        self.value_optim = optim.Adam(self.ppo_value.parameters(), lr=0.00005)
 
-        self.optimizer = optim.RMSprop(self.dqn.parameters(), lr=1e-3)
+        # self.dqn = DQN(self.state_dimension, self.hidden_size, self.num_actions).to(DEVICE)
+        # self.target_dqn = DQN(self.state_dimension, self.hidden_size, self.num_actions).to(DEVICE)
+        # self.target_dqn.load_state_dict(self.dqn.state_dict())
+        # self.target_dqn.eval()
+
+        # self.optimizer = optim.RMSprop(self.dqn.parameters(), lr=1e-3)
 
         self.cur_bellman_err = 0
 
@@ -201,7 +211,7 @@ class AgentDQN(Agent):
                     self.warm_start = 2
                 return self.rule_policy()
             else:
-                return self.DQN_policy(representation)
+                return self.PPO_policy(representation)
 
     def rule_policy(self):
         """ Rule Policy """
@@ -225,14 +235,24 @@ class AgentDQN(Agent):
 
         return self.action_index(act_slot_response)
 
-    def DQN_policy(self, state_representation):
+    def PPO_policy(self, state_representation):
         """ Return action from DQN"""
 
         with torch.no_grad():
-            action = self.dqn.predict(torch.FloatTensor(state_representation))
-        print "action:::{}".format(action)
-        print "action_type:::{}".format(type(action))
-
+            state_representation = torch.FloatTensor(state_representation)
+            state_representation = state_representation.squeeze(0)
+            # with open("/home/x/P/DDQ/mylog/final/s_p.txt", "w") as file:
+            #     file.write(str(state_representation))
+            # print("s.shape::::{}".format(state_representation.shape))
+            # print("s.type::::{}".format(type(state_representation)))
+            action = self.policy.select_action(torch.FloatTensor(state_representation))
+            # print "action:::{}".format(action)
+            # action = [np.argmax(i) for i in action]
+            action = torch.argmax(action, dim=-1)
+            action = torch.unsqueeze(action, 0)
+            # action = torch.Tensor(action_temp)
+            # print "action:::{}".format(action)
+            # print "type:::{}".format(type(action))
         return action
 
     def action_index(self, act_slot_response):
@@ -278,121 +298,135 @@ class AgentDQN(Agent):
 
         return Transition(*np_batch)
 
-    def train(self, batch_size=1, num_batches=100):
-        """ Train DQN with experience buffer that comes from both user and world model interaction."""
+    def print_log(self, variable_name, variable):
+        base_path = "/home/x/P/DDQ/mylog/ppo/"
+        variable_path = variable_name + ".txt"
+        real_path = os.path.join(base_path, variable_path)
+        with open(real_path, "w") as file:
+            file.write(str(variable))
+        print "{}.shape::::{}".format(variable_name, variable.shape)
+        print "{}.type::::{}".format(variable_name, type(variable))
+        print "-----------{}--saved----------------".format(variable_name)
+        return
+
+    def est_adv(self, r, v, mask):
+        batchsz = v.size(0)
+        # v_target = torch.Tensor(batchsz).to(device=DEVICE)
+        # delta = torch.Tensor(batchsz).to(device=DEVICE)
+        # A_sa = torch.Tensor(batchsz).to(device=DEVICE)
+        v_target = torch.Tensor(batchsz)
+        delta = torch.Tensor(batchsz)
+        A_sa = torch.Tensor(batchsz)
+        prev_v_target = 0
+        prev_v = 0
+        prev_A_sa = 0
+        for t in reversed(range(batchsz)):
+            v_target[t] = r[t] + self.gamma * prev_v_target * mask[t]
+            delta[t] = r[t] + self.gamma * prev_v * mask[t] - v[t]
+            A_sa[t] = delta[t] + self.gamma * self.tau * prev_A_sa * mask[t]
+            prev_v_target = v_target[t]
+            prev_v = v[t]
+            prev_A_sa = A_sa[t]
+        A_sa = (A_sa - A_sa.mean()) / A_sa.std()
+        return A_sa, v_target
+
+    def train(self, batch_size=1, num_batches=100, epoch=500):
+        """ Train PPO with experience buffer that comes from both user and world model interaction."""
         # print "batch_size:::{}".format(batch_size)
         # sys.exit()
         """real batch_size = 16"""
-        print "num_actions::::++++++++++++++++++++++{}".format(self.num_actions)
-        self.cur_bellman_err = 0.
-        self.cur_bellman_err_planning = 0.
-        self.running_expereince_pool = list(self.experience_replay_pool) + list(self.experience_replay_pool_from_model)
-        # with open("/home/x/P/DDQ/mylog/running_pool.txt", "w") as file:
-        #     file.write(str(self.running_expereince_pool))
-        # with open("/home/x/P/DDQ/mylog/exp_pool.txt", "w") as file:
-        #     file.write(str(self.experience_replay_pool))
-        # with open("/home/x/P/DDQ/mylog/exp_pool_model.txt", "w") as file:
-        #     file.write(str(self.experience_replay_pool_from_model))
-        # sys.exit()
-        # print "batct_size_real::::{}".format(batch_size)
-        # print "num_batch::::{}".format(num_batches)
-        # sys.exit()
         """real_num_batch=1"""
-        # rt = 0
-        for iter_batch in range(num_batches):
-            # rt = rt + 1
-            # print len(self.running_expereince_pool)
-            # print "////:{}".format(len(self.running_expereince_pool) / (batch_size))
+        print "epoch::::{}".format(epoch)
+        torch.set_printoptions(threshold=np.inf)
+        self.running_expereince_pool = list(self.experience_replay_pool) + list(self.experience_replay_pool_from_model)
+        b_z = len(self.running_expereince_pool)
+        print "b_z::::{}".format(b_z)
+        batch = self.sample_from_buffer(b_z)
+        # self.print_log('batch', batch)
+        s = torch.FloatTensor(batch.state)
+        self.print_log('s', s)
+        a = torch.tensor(batch.action).numpy()
+        a_one_hot = tf.one_hot(a, depth=29).numpy()
+        a = torch.from_numpy(a_one_hot)
+        a = a.squeeze(dim=1)
+        self.print_log('a', a)
+        r = torch.tensor(batch.reward)
+        r = r.squeeze(dim=1)
+        self.print_log('r', r)
 
-            for iter in range(len(self.running_expereince_pool) / (batch_size)):
-                self.optimizer.zero_grad()
-                batch = self.sample_from_buffer(batch_size)
-                with open("/home/x/P/DDQ/mylog/dqn/batch.txt", "w") as file:
-                    file.write(str(batch))
-                state_value = self.dqn(torch.FloatTensor(batch.state)).gather(1, torch.tensor(batch.action))
-                with open("/home/x/P/DDQ/mylog/dqn/dqn(state).txt", "w") as file:
-                    file.write(str(torch.tensor(self.dqn(torch.FloatTensor(batch.state)))))
-                with open("/home/x/P/DDQ/mylog/dqn/action.txt", "w") as file:
-                    file.write(str(torch.tensor(batch.action)))
+        v = self.ppo_value(s).squeeze(-1).detach()
+        self.print_log('v', v)
 
-                with open("/home/x/P/DDQ/mylog/dqn/state.txt", "w") as file:
-                    file.write(str(torch.tensor(batch.state)))
+        log_pi_old_sa = self.policy.get_log_prob(s, a).detach()
+        self.print_log('log_pi_old_sa', log_pi_old_sa)
 
-                with open("/home/x/P/DDQ/mylog/dqn/state_value.txt", "w") as file:
-                    file.write(str(state_value))
-                next_state_value, _ = self.target_dqn(torch.FloatTensor(batch.next_state)).max(1)
-                with open("/home/x/P/DDQ/mylog/dqn/next_state_value.txt", "w") as file:
-                    file.write(str(next_state_value))
-                next_state_value = next_state_value.unsqueeze(1)
-                with open("/home/x/P/DDQ/mylog/dqn/n_s_v_uni.txt", "w") as file:
-                    file.write(str(next_state_value))
-                term = np.asarray(batch.term, dtype=np.float32)
-                # print "term::::{}".format(term)
-                with open("/home/x/P/DDQ/mylog/dqn/term.txt", "w") as file:
-                    file.write(str(term))
-                expected_value = torch.FloatTensor(batch.reward) + self.gamma * next_state_value * (
-                    1 - torch.FloatTensor(term))
-                with open("/home/x/P/DDQ/mylog/dqn/expected_value.txt", "w") as file:
-                    file.write(str(expected_value))
+        mask = torch.zeros_like(r)
+        mask[r == -1] = 1
+        self.print_log('mask', mask)
 
-                loss = F.mse_loss(state_value, expected_value)
+        A_sa, v_target = self.est_adv(r, v, mask)
+        self.print_log('A_sa', A_sa)
+        self.print_log('v_target', v_target)
+
+        for i in range(5):
+            perm = torch.randperm(b_z)
+            v_target_shuf, A_sa_shuf, s_shuf, a_shuf, log_pi_old_sa_shuf = v_target[perm], A_sa[perm], s[perm], a[perm], \
+                                                                           log_pi_old_sa[perm]
+            self.print_log("s_shuf", s_shuf)
+            optim_chunk_num = int(np.ceil(b_z / 16))
+            print "optim_chunk_num::::{}".format(optim_chunk_num)
+            v_target_shuf, A_sa_shuf, s_shuf, a_shuf, log_pi_old_sa_shuf = torch.chunk(v_target_shuf, optim_chunk_num), \
+                                                                           torch.chunk(A_sa_shuf, optim_chunk_num), \
+                                                                           torch.chunk(s_shuf, optim_chunk_num), \
+                                                                           torch.chunk(a_shuf, optim_chunk_num), \
+                                                                           torch.chunk(log_pi_old_sa_shuf,
+                                                                                       optim_chunk_num)
+            with open("/home/x/P/DDQ/mylog/ppo/s_shuf_mini.txt", "w") as file:
+                file.write(str(s_shuf))
+            print "s_shuf_mini.type::::{}".format(type(s_shuf))
+
+            policy_loss, value_loss = 0., 0.
+            for v_target_b, A_sa_b, s_b, a_b, log_pi_old_sa_b in zip(v_target_shuf, A_sa_shuf, s_shuf, a_shuf,
+                                                                     log_pi_old_sa_shuf):
+                self.value_optim.zero_grad()
+                v_b = self.ppo_value(s_b).squeeze(-1)
+                loss = (v_b - v_target_b).pow(2).mean()
+                value_loss += loss.item()
                 loss.backward()
-                self.optimizer.step()
-                self.cur_bellman_err += loss.item()
-            print "------------------------action_dim::::{}".format(batch.action.shape)
-            print "------------------------state_dim::::{}".format(batch.state.shape)
-            if len(self.experience_replay_pool) != 0:
-                print (
-                    "cur bellman err %.4f, experience replay pool %s, model replay pool %s, cur bellman err for planning %.4f" % (
-                        float(self.cur_bellman_err) / (len(self.experience_replay_pool) / (float(batch_size))),
-                        len(self.experience_replay_pool), len(self.experience_replay_pool_from_model),
-                        self.cur_bellman_err_planning))
-        # print "rt::::{}".format(rt)
-    # def train_one_iter(self, batch_size=1, num_batches=100, planning=False):
-    #     """ Train DQN with experience replay """
-    #     self.cur_bellman_err = 0
-    #     self.cur_bellman_err_planning = 0
-    #     running_expereince_pool = self.experience_replay_pool + self.experience_replay_pool_from_model
-    #     for iter_batch in range(num_batches):
-    #         batch = [random.choice(self.experience_replay_pool) for i in xrange(batch_size)]
-    #         np_batch = []
-    #         for x in range(5):
-    #             v = []
-    #             for i in xrange(len(batch)):
-    #                 v.append(batch[i][x])
-    #             np_batch.append(np.vstack(v))
-    #
-    #         batch_struct = self.dqn.singleBatch(np_batch)
-    #         self.cur_bellman_err += batch_struct['cost']['total_cost']
-    #         if planning:
-    #             plan_step = 3
-    #             for _ in xrange(plan_step):
-    #                 batch_planning = [random.choice(self.experience_replay_pool) for i in
-    #                                   xrange(batch_size)]
-    #                 np_batch_planning = []
-    #                 for x in range(5):
-    #                     v = []
-    #                     for i in xrange(len(batch_planning)):
-    #                         v.append(batch_planning[i][x])
-    #                     np_batch_planning.append(np.vstack(v))
-    #
-    #                 s_tp1, r, t = self.user_planning.predict(np_batch_planning[0], np_batch_planning[1])
-    #                 s_tp1[np.where(s_tp1 >= 0.5)] = 1
-    #                 s_tp1[np.where(s_tp1 <= 0.5)] = 0
-    #
-    #                 t[np.where(t >= 0.5)] = 1
-    #
-    #                 np_batch_planning[2] = r
-    #                 np_batch_planning[3] = s_tp1
-    #                 np_batch_planning[4] = t
-    #
-    #                 batch_struct = self.dqn.singleBatch(np_batch_planning)
-    #                 self.cur_bellman_err_planning += batch_struct['cost']['total_cost']
-    #
-    #     if len(self.experience_replay_pool) != 0:
-    #         print ("cur bellman err %.4f, experience replay pool %s, cur bellman err for planning %.4f" % (
-    #             float(self.cur_bellman_err) / (len(self.experience_replay_pool) / (float(batch_size))),
-    #             len(self.experience_replay_pool), self.cur_bellman_err_planning))
+                self.value_optim.step()
+                self.policy_optim.zero_grad()
+                log_pi_sa = self.policy.get_log_prob(s_b, a_b)
+                ratio = (log_pi_sa - log_pi_old_sa_b).exp().squeeze(-1)
+                ratio = torch.clamp(ratio, 0, 10)
+                surrogate1 = ratio * A_sa_b
+                surrogate2 = torch.clamp(ratio, 1 - self.ppo_epsilon, 1 + self.ppo_epsilon) * A_sa_b
+                surrogate = - torch.min(surrogate1, surrogate2).mean()
+                policy_loss += surrogate.item()
+                surrogate.backward()
+                for p in self.policy.parameters():
+                    p.grad[p.grad != p.grad] = 0.0
+                torch.nn.utils.clip_grad_norm(self.policy.parameters(), 10)
+                self.policy_optim.step()
+            value_loss /= optim_chunk_num
+            policy_loss /= optim_chunk_num
+            logging.debug('<<dialog policy ppo>> epoch {}, iteration {}, value, loss {}'.format(epoch, i, value_loss))
+            logging.debug('<<dialog policy ppo>> epoch {}, iteration {}, policy, loss {}'.format(epoch, i, policy_loss))
+
+        if (epoch + 1) % 10 == 0:
+            self.save_ppo("/home/x/P/DDQ/ppo_model", epoch)
+
+
+        # print "test"
+        # sys.exit()
+
+    def save_ppo(self, directory, epoch):
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+
+        torch.save(self.ppo_value.state_dict(), directory + '/' + str(epoch) + '_ppo.val.mdl')
+        torch.save(self.policy.state_dict(), directory + '/' + str(epoch) + '_ppo.pol.mdl')
+
+        logging.info('<<dialog policy>> epoch {}: saved network to mdl'.format(epoch))
 
     ################################################################################
     #    Debug Functions
@@ -412,22 +446,27 @@ class AgentDQN(Agent):
 
         self.experience_replay_pool = pickle.load(open(path, 'rb'))
 
-    def load_trained_DQN(self, path):
+    def load_trained_PPO(self, path):
         """ Load the trained DQN from a file """
 
         trained_file = pickle.load(open(path, 'rb'))
         model = trained_file['model']
-        print "Trained DQN Parameters:", json.dumps(trained_file['params'], indent=2)
+        print "Trained PPO Parameters:", json.dumps(trained_file['params'], indent=2)
         return model
 
     def set_user_planning(self, user_planning):
         self.user_planning = user_planning
 
-    def save(self, filename):
-        torch.save(self.dqn.state_dict(), filename)
+    def save_value(self, filename):
+        torch.save(self.ppo_value.state_dict(), filename)
 
-    def load(self, filename):
-        self.dqn.load_state_dict(torch.load(filename))
+    def save_policy(self, filename):
+        torch.save(self.policy.state_dict(), filename)
 
-    def reset_dqn_target(self):
-        self.target_dqn.load_state_dict(self.dqn.state_dict())
+    def load_value(self, filename):
+        self.ppo_value.load_state_dict(torch.load(filename))
+
+    def load_policy(self, filename):
+        self.policy.load_state_dict(torch.load(filename))
+
+

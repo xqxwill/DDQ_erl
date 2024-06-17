@@ -1,0 +1,6 @@
+{'agent_action': None, 
+'user_action': {'request_slots': {'starttime': 'UNK'}, 'turn': 0, 'speaker': 'user', 'inform_slots': {'moviename': 'avengers'}, 'diaact': 'request'}, 
+'turn': 1, 
+'current_slots': {'request_slots': {'starttime': 'UNK'}, 'agent_request_slots': {}, 'inform_slots': {'moviename': 'avengers'}, 'proposed_slots': {}}, 
+'kb_results_dict': {'matching_all_constraints': 0, 'moviename': 0}, 
+'history': [{'request_slots': {'starttime': 'UNK'}, 'turn': 0, 'speaker': 'user', 'inform_slots': {'moviename': 'avengers'}, 'diaact': 'request'}]}

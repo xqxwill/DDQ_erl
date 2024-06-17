@@ -5,6 +5,8 @@ Created on May 17, 2016
 """
 
 import json
+import sys
+
 from . import StateTracker
 from deep_dialog import dialog_config
 import copy
@@ -66,8 +68,12 @@ class DialogManager:
         #   CALL AGENT TO TAKE HER TURN
         ########################################################################
         self.state = self.state_tracker.get_state_for_agent()
+        # print "state_agent::::{}".format(self.state)
+        # with open("/home/x/P/DDQ/mylog/agent_state.txt", "w") as file:
+        #     file.write(str(self.state))
         self.agent_action = self.agent.state_to_action(self.state)
-
+        # print "action_agent::::{}".format(self.agent_action)
+        # sys.exit()
         ########################################################################
         #   Register AGENT action with the state_tracker
         ########################################################################
@@ -101,6 +107,7 @@ class DialogManager:
         ########################################################################
         #  Inform agent of the outcome for this timestep (s_t, a_t, r, s_{t+1}, episode_over, s_t_u, user_world_model)
         ########################################################################
+        # print "agent_action::::{}".format(self.agent_action)
         if record_training_data:
             self.agent.register_experience_replay_tuple(self.state, self.agent_action, self.reward,
                                                         self.state_tracker.get_state_for_agent(), self.episode_over,
