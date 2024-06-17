@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Deep Dyna-Q: Integrating Planning for Task-Completion Dialogue Policy Learning
 *An implementation of the  
 [Deep Dyna-Q: Integrating Planning for Task-Completion Dialogue Policy Learning](https://arxiv.org/abs/1801.06176)*
@@ -145,3 +146,6 @@ Main papers to be cited
   journal={arXiv preprint arXiv:1612.05688},
   year={2016}
 }
+=======
+# DDQ_erl
+>>>>>>> 63ba092abeb0fea09ae2a58c4551343f9ae99a6d
