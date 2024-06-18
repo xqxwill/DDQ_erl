@@ -367,7 +367,7 @@ class AgentPPO(Agent):
         A_sa, v_target = self.est_adv(r, v, mask)
         self.print_log('A_sa', A_sa)
         self.print_log('v_target', v_target)
-
+        """-------"""
         for i in range(5):
             perm = torch.randperm(b_z)
             v_target_shuf, A_sa_shuf, s_shuf, a_shuf, log_pi_old_sa_shuf = v_target[perm], A_sa[perm], s[perm], a[perm], \
